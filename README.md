@@ -6,3 +6,16 @@ We test this method with three models:
 1. 1-D Polynomial Regression
 2. Multilayer Perceptron (MLP)
 3. Graph Convolutional Network (GCN) predicting lipophilicity
+
+Read the [paper](https://arxiv.org/abs/2304.10510)
+
+```bibtex
+@article{campbell2023censoring,
+      title={Censoring chemical data to mitigate dual use risk}, 
+      author={Quintina L. Campbell and Jonathan Herington and Andrew D. White},
+      year={2023},
+      eprint={2304.10510},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG}
+}
+```

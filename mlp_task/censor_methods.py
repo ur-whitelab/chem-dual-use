@@ -64,6 +64,7 @@ def noising(
 
     return torch.tensor(xn), torch.tensor(yn)
 
+# decided to not use this - too 'random' to study the effect of omission
 def omit_sensitive_data_probabilistic(
         data, threshold, sensitive_region, omit_probability=1, plot=False
     ):
@@ -171,33 +172,3 @@ def omit_sensitive_data(data, threshold, sensitive_region, omit_fraction=1, plot
         plt.show()
     
     return filtered_x, filtered_y
-
-# def filterdata_by_label(data, threshold, omitregion):
-#     if omitregion not in ['above', 'below']:
-#         raise ValueError("omitregion must be either 'above' or 'below'")
-#     x,y = data
-#     filtered_x = []
-#     filtered_y = []
-
-#     for i, label in enumerate(y):
-#         if omitregion == 'above':
-#             if label < threshold:
-#                 filtered_x.append(x[i])
-#                 filtered_y.append(label)
-#         else:
-#             if label > threshold:
-#                 filtered_x.append(x[i])
-#                 filtered_y.append(label)
-
-#     if len(filtered_x) == 1:
-#         filtered_x = filtered_x[0]
-#     else:
-#         x_shape = filtered_x[0].shape
-#         filtered_x = torch.stack(filtered_x).reshape(len(filtered_x), *x_shape)
-
-#     if len(filtered_y) == 1:
-#         filtered_y = filtered_y[0]
-#     else:
-#         filtered_y = torch.tensor(filtered_y)
-
-#     return filtered_x, filtered_y

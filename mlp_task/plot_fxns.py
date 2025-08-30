@@ -69,5 +69,12 @@ def create_dataframe(full_results):
     data['s=0 RMSE std'] = full_results['lower_error_std']
     data['s=1 RMSE'] = full_results['upper_error_mean']
     data['s=1 RMSE std'] = full_results['upper_error_std']
+    
+    data['over_corr'] = full_results.get('overall_corr_mean')
+    data['over_corr std'] = full_results.get('overall_corr_std')
+    data['s=0 corr'] = full_results.get('lower_corr_mean')
+    data['s=0 corr std'] = full_results.get('lower_corr_std')
+    data['s=1 corr'] = full_results.get('upper_corr_mean')
+    data['s=1 corr std'] = full_results.get('upper_corr_std')
 
     return pd.DataFrame.from_dict(data)

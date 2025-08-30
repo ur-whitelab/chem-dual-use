@@ -1,25 +1,30 @@
+from dataclasses import dataclass
+from functools import partial
+import json
+import os
+import random
 import urllib.request
+
+import exmol
+import numpy as np
 import pandas as pd
+from rdkit import Chem
+from rdkit.Chem import rdmolops, rdmolfiles
+from scipy.stats import spearmanr
+import selfies as sf
+from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 import dgl
 from dgl.data import DGLDataset
+from dgl.dataloading import GraphDataLoader
+from dgl.nn import GraphConv
 #from dgllife.utils import SMILESToBigraph, smiles_to_bigraph, mol_to_bigraph # it's broken as of Feb 13 2023
 from dgllife.utils import CanonicalBondFeaturizer, CanonicalAtomFeaturizer
-from dgl.nn import GraphConv
-from rdkit import Chem
-from functools import partial
-from rdkit.Chem import rdmolops, rdmolfiles
-import numpy as np
-from torch.utils.data.sampler import SubsetRandomSampler
-from dgl.dataloading import GraphDataLoader
-from dgl.data.utils import Subset, split_dataset
-from dataclasses import dataclass
-import os 
-import json
-import exmol
-import random
+
+
 os.environ['DGLBACKEND'] = 'pytorch'
 os.environ['OMP_NUM_THREADS'] = '1' # to ensure reproducible results and that DGL doesn't use OpenMP & introduce randomness 
 os.environ['CUBLAS_WORKSPACE_CONFIG']=':4096:8'
@@ -48,10 +53,17 @@ class Config:
     epochs: int = 60
     patience: int = 5
     min_delta: float = 1e-4 # for early stopping
+    loss_func: str = 'mse' # 'mse' or 'rmse'
 
-# functions copied from dgllife github: 
-#       mol_to_graph, construct_bigraph_from_mol, mol_to_bigraph 
-# (using them directly from them doesn't work for some reason)
+"""
+functions copied from dgllife github: 
+    - mol_to_graph, 
+    - construct_bigraph_from_mol, 
+    - mol_to_bigraph 
+    
+    (using them directly from them doesn't work for some reason)
+
+"""
 def mol_to_graph(mol, graph_constructor, node_featurizer, edge_featurizer,
                  canonical_atom_order, explicit_hydrogens=False, num_virtual_nodes=0):
     if mol is None:
@@ -145,42 +157,43 @@ def largest_mol(smiles):
   ss.sort(key = lambda a: len(a))
   return ss[-1]
 
-def get_noised_SMILES(smi, min_score, max_score, num_samples, preset='medium'):
-    noised_smiles = None
-    iter = 0
-    while noised_smiles == None:
+
+def get_noised_SMILES(smi, min_score, max_score, num_samples, preset='medium', ignore_fail_error=True, max_tries=10):
+    # get a different SMILES with similarity score between min_score and max_score
+    # first come first serve
+    if min_score == 1.0 and max_score == 1.0:
+        return smi, 1.0, True
+    method_kwargs = {
+        "num_samples": num_samples,
+        "min_mutations": 1,
+        "max_mutations": 1,
+    }
+    num_tries = 0
+    while num_tries < max_tries:
         examples = exmol.sample_space(
-            smi, 
-            preset=preset,  
-            f=lambda x: 0, 
-            batched=False, 
-            quiet=True, 
-            min_mutations=3,
-            max_mutations=3,
-            num_samples=num_samples,
+            smi,
+            preset=preset,
+            f=lambda x: 0,
+            batched=False,
+            quiet=True,
+            method_kwargs=method_kwargs
         )
-        examples.pop(0) # first has 1.0 similiarity
-        smiles = [e.smiles for e in examples]
-        scores = [e.similarity for e in examples]
-        for i in range(len(scores)):
-            if min_score < scores[i] < max_score:
-                # first SMILES within the score range is selected
-                noised_smiles = smiles[i] 
-                score = scores[i]
-            elif min(scores) > bestscore: 
-                # if failed to get desired similiarity, 
-                # save the lower similarity score closest to minimum desired score 
-                bestscore = max(scores)
-                idx = scores.index(bestscore)
-                max_smi = smiles[idx]
-        iter += 1
-        if iter > 10:
-            print(f'Cannot find SMILES between {min_score} and {max_score}!')
-            print(f'Proceed with SMILES with next closest similarity score: {max_smi}')
-            score = bestscore
-            noised_smiles = max_smi
-            break
-    return noised_smiles, score
+        smiles = [e.smiles for e in examples[1:]] # ignore first with 1.0 score
+        scores = [e.similarity for e in examples[1:]]
+        for smile, score in zip(smiles, scores):
+            if min_score < score < max_score:
+                return smile, score, True
+        if max_score <= 0.3:
+            # increase mutations for higher chance with low similarities
+            method_kwargs['max_mutations'] += 1
+        method_kwargs['num_samples'] += 10
+        num_tries += 1
+
+    msg = f'Cannot find another SMILES between {min_score} and {max_score} for this SMILES!'
+    msg += f'\nSMILES: {smi}'
+    if ignore_fail_error == False:
+        raise Exception(msg)
+    return smi, 1.0, False
 
 class LipophilicityDataset(DGLDataset):
     def __init__(self):
@@ -236,14 +249,14 @@ class dgldataset(DGLDataset):
 
     def process(self):
         '''
-        Extract smiles & labels from data in .csv file.
         DGL graph is created for each smiles string.
         '''
-        #smiles, labels = zip(*self.data)
         self.graphs = []
         self.labels = []
-        for smi, label in self.data:
-        #for smi, label in zip(smiles, labels):
+
+        for _, row in self.data.iterrows():
+            smi = row['smiles']
+            label = row['labels']
             smi = largest_mol(smi)
             mol = Chem.MolFromSmiles(smi)
             g = mol_to_bigraph(mol,  
@@ -252,7 +265,7 @@ class dgldataset(DGLDataset):
                                explicit_hydrogens=False, # loss reduces when it's False
                                add_self_loop=False,
                                )
-            if g != None:
+            if g is not None:
                 self.graphs.append(g)
                 self.labels.append(label)
 
@@ -280,41 +293,44 @@ class Xnoised_dataset(DGLDataset):
         self.smiles = []
         self.rawsmiles = []
         self.similarityscores = []
-        self.iterations = []
         noised_smiles_count = 0
         fail_count = 0
-        for smi, label in self.data:
-            score = 'None'
-            bestscore = 0
-            iter = None
+        for _, row in self.data.iterrows():
+            smi = row['smiles']
+            label = row['labels']
             smi = largest_mol(smi)
             self.rawsmiles.append(smi)
 
+            score = None
+            if minscore == 1.0 and maxscore == 1.0:
+                score = 1.0
             # replace SMILES with noisy SMILES if it's in the target region
-            if self.targetregion == 'below':
+            elif self.targetregion == 'below':
                 if label < self.threshold:
-                    noised_smiles, score = get_noised_SMILES(
+                    noised_smiles, score, success = get_noised_SMILES(
                         smi, minscore, maxscore, num_samples=15, preset=self.preset
                     )
-                    if score < minscore or score > maxscore:
+                    if success == False: 
+                        # sometimes it fails to get desired score - drop that data point
                         fail_count += 1
+                        continue
                     smi = noised_smiles
                     noised_smiles_count += 1
 
             elif self.targetregion == 'above':
                 if label > self.threshold:
-                    noised_smiles, score = get_noised_SMILES(
+                    noised_smiles, score, success = get_noised_SMILES(
                         smi, minscore, maxscore, num_samples=15, preset=self.preset
                     )
-                    
-                    if score < minscore or score > maxscore:
+                    if success == False:
                         fail_count += 1
+                        continue
                     smi = noised_smiles
                     noised_smiles_count += 1
             else: 
                 raise Exception("'targetregion' can only take 'below' or 'above'")
             
-            #make a graph
+            #make a SMILES graph
             mol = Chem.MolFromSmiles(smi)
             g = mol_to_bigraph(mol,  
                                node_featurizer=CanonicalAtomFeaturizer('feat'),
@@ -325,11 +341,10 @@ class Xnoised_dataset(DGLDataset):
             self.graphs.append(g)
             self.labels.append(label)
             self.similarityscores.append(score)
-            self.iterations.append(iter)
-        print(f'Noised {noised_smiles_count} SMILES out of {len(self.smiles)} total')
-        print(f'Out of {noised_smiles_count} noisy SMILES, {fail_count}' 
-              'failures to generate SMILES within desired similarity scores.' 
-              f'Similarity scores lower than {minscore} are used instead.')
+        if noised_smiles_count > 0:
+            print(f'Noised {noised_smiles_count} smiles out of data with {len(self.smiles)} smiles.')
+            print(f'While adding feature noise, {fail_count} data points failed to '
+                'generate SMILES within desired similarity scores. Removed from dataset.')
 
     def __getitem__(self, i):
         return self.graphs[i], self.labels[i]
@@ -351,8 +366,11 @@ class Ynoised_dataset(DGLDataset):
         self.labels = []
         self.rawlabels = [] # non-noised labels
 
-        for smi, label in self.data:
+        for _, row in self.data.iterrows():
+            smi = row['smiles']
+            label = row['labels']
             self.rawlabels.append(label)
+
             if self.targetregion == 'below':
                 if label < self.threshold:
                     label = self.mag_noise * np.random.normal() + label
@@ -362,7 +380,7 @@ class Ynoised_dataset(DGLDataset):
             else: 
                 raise Exception("'targetregion' argument can only accept 'below' or 'above'")
             
-            #make a graph
+            #make a SMILES graph
             smi = largest_mol(smi)
             mol = Chem.MolFromSmiles(smi)
             g = mol_to_bigraph(mol,  
@@ -425,19 +443,6 @@ class RMSELoss(nn.Module):
         loss = torch.sqrt(self.mse(yhat,y) + self.eps)
         return loss
 
-# def old_train(model, batched_data, optimizer,device):
-#     model.train()
-#     graphs, labels = batched_data
-#     graphs = graphs.to(device)
-#     # forward
-#     pred = model(graphs,graphs.ndata['feat'].float())
-#     loss = F.mse_loss(pred, labels.float())
-#     # backward
-#     optimizer.zero_grad()
-#     loss.backward()
-#     optimizer.step()
-#     return loss.item()
-
 def compute_threshold_from_split(labels, split, region):
     """
     Computes a threshold from a given split ratio based on labels and 
@@ -460,7 +465,14 @@ def train(model, model_config, train_data, val_data, verbose = True):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=model_config.lr)
     early_stopper = EarlyStopper(patience=model_config.patience, min_delta=model_config.min_delta)
-    rmse = RMSELoss()
+    if model_config.loss_func == 'mse':
+        calc_loss = nn.MSELoss()
+        use_rmse = False
+    elif model_config.loss_func == 'rmse':
+        calc_loss = RMSELoss()
+        use_rmse = True
+    if verbose:
+        print(f'Using {model_config.loss_func} as loss function.')
 
     best_val_loss = float('inf')
     train_loss = []
@@ -473,7 +485,7 @@ def train(model, model_config, train_data, val_data, verbose = True):
             graphs = graphs.to(device)
             # forward
             pred = model(graphs,graphs.ndata['feat'].float())
-            loss = rmse(pred, labels.float())
+            loss = calc_loss(pred, labels.float())
             # backward
             optimizer.zero_grad()
             loss.backward()
@@ -484,7 +496,7 @@ def train(model, model_config, train_data, val_data, verbose = True):
 
         curr_val_loss = 0.0
         for batched_data in val_dataloader:
-            _, loss = evaluate(model, batched_data)
+            _, loss = evaluate(model, batched_data, use_rmse=use_rmse)
             curr_val_loss += loss
         curr_val_loss /= len(val_dataloader)
         val_loss.append(curr_val_loss)
@@ -499,17 +511,42 @@ def train(model, model_config, train_data, val_data, verbose = True):
             break
     return train_loss, val_loss
 
-def local_rmse(y,yhat, ymin, ymax):
-    rmse = RMSELoss()
+def local_loss(y,yhat, ymin, ymax, use_rmse=True):
     y, yhat = torch.tensor(y), torch.tensor(yhat)
     mask = (y >= ymin) & (y <= ymax)
     local_y = y[mask]
     local_yhat = yhat[mask]
-    local_rmse = rmse(local_yhat, local_y)
-    return local_rmse.item()
+    local_mse = F.mse_loss(local_yhat, local_y)
+    if use_rmse:
+        local_rmse = torch.sqrt(local_mse)
+        return local_rmse.item()
+    return local_mse.item()
 
-def evaluate(model, data):
-    rmse = RMSELoss()
+def local_spearman(y, yhat, threshold, above=True):
+    # Filter y and yhat based on the threshold
+    if above:
+        mask = np.array(y) > threshold
+    else:
+        mask = np.array(y) <= threshold
+
+    local_y = np.array(y)[mask]
+    local_yhat = np.array(yhat)[mask]
+
+    if len(local_y) > 1:  # Ensure there are at least 2 data points
+        corr, _ = spearmanr(local_y, local_yhat)
+        return corr
+    else:
+        return np.nan  # Not enough data points for a valid correlation
+
+def evaluate(model, data, use_rmse=True):
+    '''
+    calculate loss on validation or test data
+
+    Args:
+    - model: the trained model
+    - data: the validation or test data
+    - use_rmse: whether to use RMSE or MSE as loss function. True is RMSE, False is MSE
+    '''
     model.eval()
     graphs, labels = data
     if isinstance(graphs, list):
@@ -519,112 +556,168 @@ def evaluate(model, data):
             with torch.no_grad():
                 pred = model(graph, graph.ndata['feat'].float())
             preds.append(pred.item())
-        loss = rmse(torch.FloatTensor(preds), torch.FloatTensor(labels))   
+        loss = F.mse_loss(torch.FloatTensor(preds), torch.FloatTensor(labels))   
     else:
         # if data is batched data or single data point
         with torch.no_grad():
             preds = model(graphs, graphs.ndata['feat'].float())
-        loss = rmse(preds, labels.float())
+            labels = labels.float()
+            if labels.shape != preds.shape:
+                if preds.dim() == 0:
+                    preds = torch.tensor([preds])
+                else:
+                    print('Shapes of labels and predictions do not match.')
+                    print("preds shape: ", preds.shape)
+                    print("labels shape: ", labels.shape)
+                    print("preds: ", preds)
+                    print("labels: ", labels)
+        loss = F.mse_loss(preds, labels.float())
+    if use_rmse:
+        loss = torch.sqrt(loss)
     return preds, loss.item() 
 
-# def filterdata_by_label(dataset, threshold, omitregion):
-#     if omitregion not in ['above', 'below']:
-#         raise ValueError("omitregion must be either 'above' or 'below'")
-#     elif omitregion == 'above':
-#         return [(smiles,label) for (smiles, label) in dataset if label < threshold]
-#     else:
-#         return [(smiles,label) for (smiles, label) in dataset if label > threshold]
+def omit_sensitive_data_rank_based(df, threshold, omit_region, omit_frac=1):
+    # Omits a fraction of sensitive data based on ranking in a specified region.
+    # First omits the most sensitive data points (highest or lowest)
+    if omit_frac == 0:
+        return df
+    if omit_region not in ['above', 'below']:
+        raise ValueError("omit_region must be either 'above' or 'below'")
+    if not 0 <= omit_frac <= 1:
+        raise ValueError("omit_fraction must be in the range [0,1]")
+    
+    if omit_region == 'above':
+        is_sensitive = df['labels'] > threshold
+    else:
+        is_sensitive = df['labels'] < threshold
 
-def omit_sensitive_data(dataset, threshold, omit_region, omit_frac=1):
+    sensitive_data = df[is_sensitive]
+    non_sensitive_data = df[~is_sensitive]
+    if omit_frac == 1:
+        return non_sensitive_data
+    
+    # rank sensitive data based on labels and calculate the number of items to omit
+    if omit_region == 'above':
+        # for 'above', higher labels are more sensitive, so sort descending
+        sensitive_data_sorted = sensitive_data.sort_values(by='labels', ascending=False)
+    else:
+        # for 'below', lower labels are more sensitive, so sort ascending
+        sensitive_data_sorted = sensitive_data.sort_values(by='labels', ascending=True)
+
+    num_to_omit = int(len(sensitive_data_sorted) * omit_frac)
+    kept_sensitive_data = sensitive_data_sorted[num_to_omit:]
+    result_df = pd.concat([kept_sensitive_data, non_sensitive_data], ignore_index=True)
+
+    return result_df
+
+
+def omit_sensitive_data(df, threshold, omit_region, omit_frac=1):
+    if omit_frac == 0:
+        return df
     if omit_region not in ['above', 'below']:
         raise ValueError("omit_region must be either 'above' or 'below'")
     if not 0 <= omit_frac <= 1:
         raise ValueError("omit_fraction must be in the range [0,1]")
 
     if omit_region == 'above':
-        sensitive_data = [
-            (smiles,label) for (smiles, label) in dataset if label > threshold
-        ]
-        non_sensitive_data = [
-            (smiles,label) for (smiles, label) in dataset if label <= threshold
-        ]
+        sensitive_data = df[df['labels'] > threshold]
+        non_sensitive_data = df[df['labels'] <= threshold]
     else:
-        sensitive_data = [
-            (smiles,label) for (smiles, label) in dataset if label < threshold
-        ]
-        non_sensitive_data = [
-            (smiles,label) for (smiles, label) in dataset if label >= threshold
-        ]
+        sensitive_data = df[df['labels'] < threshold]
+        non_sensitive_data = df[df['labels'] >= threshold]
     
     if omit_frac == 1:
         return non_sensitive_data
     else:
         omit_size = int(omit_frac * len(sensitive_data))
-        kept_sensitive_data = random.sample(
-            sensitive_data, len(sensitive_data) - omit_size
-        )
-    print(f"Kept {len(kept_sensitive_data)} sensitive data points out of " 
-          f"{len(sensitive_data)} total (sensitive only).")
-    print(f"Fraction omitted: "
-          f"{(1 - len(kept_sensitive_data) / len(sensitive_data))*100}")
-    return kept_sensitive_data + non_sensitive_data
+        kept_indices = random.sample(list(sensitive_data.index), len(sensitive_data) - omit_size)
+        kept_sensitive_data = sensitive_data.loc[kept_indices]
+    print(f"Kept {len(kept_sensitive_data)} out of {len(sensitive_data)} sensitive data points.")
+    omitted_fraction = (1 - len(kept_sensitive_data) / max(len(sensitive_data), 1)) * 100
+    print(f"Fraction omitted: {omitted_fraction:.2f}%")
 
-def omit_sensitive_data_probabilistic(
-        dataset, threshold, omit_region, omit_frac=1):
-    # love the probabilistic omission method but it's too random to measure its effect
+    result_df = pd.concat([kept_sensitive_data, non_sensitive_data], ignore_index=True)
+    return result_df
+
+# we don't use this - too random to study its effects - great for censoring purpose though
+def omit_sensitive_data_probabilistic(df, threshold, omit_region, omit_frac=1):
+    if omit_frac == 0:
+        return df
     if omit_region not in ['above', 'below']:
         raise ValueError("omit_region must be either 'above' or 'below'")
     if not 0 <= omit_frac <= 1:
         raise ValueError("omit fraction must be in the range [0,1]")
 
-    # Separate data into sensitive and non-sensitive based on threshold and region
+    # separate data into sensitive and non-sensitive based on threshold and region
     if omit_region == 'above':
-        sensitive_data = [
-            (smiles, label) for (smiles, label) in dataset if label > threshold
-        ]
-        non_sensitive_data = [
-            (smiles, label) for (smiles, label) in dataset if label <= threshold
-        ]
+        is_sensitive = df['labels'] > threshold
     else:
-        sensitive_data = [
-            (smiles, label) for (smiles, label) in dataset if label < threshold
-        ]
-        non_sensitive_data = [
-            (smiles, label) for (smiles, label) in dataset if label >= threshold
-        ]
+        is_sensitive = df['labels'] < threshold
+    
+    sensitive_data = df[is_sensitive]
+    non_sensitive_data = df[~is_sensitive]
+
     if omit_frac == 1:
         return non_sensitive_data
 
-    # Probabilistically keep or omit sensitive data points
-    kept_sensitive_data = []
-    for (smiles, label) in sensitive_data:
-        if random.random() > omit_frac:
-            kept_sensitive_data.append((smiles, label))
-    print(f"Kept {len(kept_sensitive_data)} sensitive data points out of " 
-          f"{len(sensitive_data)} total (sensitive only).")
-    print(f"Fraction omitted: "
-          f"{(1 - len(kept_sensitive_data) / len(sensitive_data))*100}")
+    # probabilistically keep or omit sensitive data points, aka. probabilistic omission
+    keep_mask = np.random.rand(len(sensitive_data)) > omit_frac
+    kept_sensitive_data = sensitive_data[keep_mask]
 
-    return kept_sensitive_data + non_sensitive_data
+    print(f"Kept {len(kept_sensitive_data)} out of {len(sensitive_data)} sensitive data points.")
+    omitted_fraction = (1 - len(kept_sensitive_data) / max(len(sensitive_data), 1)) * 100
+    print(f"Fraction omitted: {omitted_fraction:.2f}%")
+
+    result_df = pd.concat([kept_sensitive_data, non_sensitive_data], ignore_index=True)
+    return result_df
 
 # no noise for control
 def no_noise_train_wrapper(
-        rawdata, 
-        sensitive_region=None, 
-        sensitive_threshold=None,
-        sensitive_split=None,
+        censor_region, 
+        censor_threshold=None,
+        censor_split=None,
         model_config=None,
         jobname='zero_noise',
         dir_name=None,
         random_state=None, 
         verbose=True,
+        rawdata = None,
+        separate_train_path=None,  # Path to pre-split training data
+        separate_val_path=None,    # Path to pre-split validation data
+        separate_test_path=None,
+        save_split_data = True,
     ):
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
     if model_config == None:
         model_config = Config()
 
-    train_subset, val_subset, test_subset = split_dataset(
-        rawdata, frac_list=[0.8, 0.1, 0.1], shuffle=True,random_state=random_state
-    )
+    if separate_train_path and separate_val_path and separate_test_path:
+        train_subset = pd.read_csv(separate_train_path)
+        val_subset = pd.read_csv(separate_val_path)
+        test_subset = pd.read_csv(separate_test_path)
+        if censor_threshold is not None:
+            print(f'Censor threshold = {censor_threshold}')
+    else:
+        if rawdata is None:
+            raise ValueError("rawdata must be provided if pre-split data paths are not specified.")
+        # compute threshold from sensitive/non-sensitive split
+        if censor_threshold is None and censor_split is not None:
+            censor_threshold = compute_threshold_from_split(
+                rawdata.labels, censor_split, censor_region
+            )
+            print(f"With {censor_split:.0%} censored split, ")
+            print(f"censor threshold = {censor_threshold}")
+
+        # split data
+        train_subset, nontrain_subset = train_test_split(rawdata, test_size=2*model_config.split, random_state=random_state)
+        val_subset, test_subset = train_test_split(nontrain_subset, test_size=0.5, random_state=random_state)
+        if dir_name and save_split_data:
+            os.makedirs(f"{dir_name}/data", exist_ok=True)
+            train_subset.to_csv(f"{dir_name}/data/train_data_{random_state}.csv", index=False)
+            val_subset.to_csv(f"{dir_name}/data/val_data_{random_state}.csv", index=False)
+            test_subset.to_csv(f"{dir_name}/data/test_data_{random_state}.csv", index=False)
+
     train_data = dgldataset(train_subset)
     val_data = dgldataset(val_subset)
     test_data = dgldataset(test_subset)
@@ -640,21 +733,16 @@ def no_noise_train_wrapper(
     ymin = min(ytest)
     ymax = max(ytest)
     yhat, rmse = evaluate(model, (test_data.graphs, ytest))
+    corr = spearmanr(ytest,yhat)[0]
 
-    # compute RMSE for sensitive/non-sensitive region if split or threshold is given
-    if sensitive_split is not None:
-        sensitive_threshold = compute_threshold_from_split(
-            ytest, sensitive_split, sensitive_region
-        )
-        print(f"With {sensitive_split:.0%} sensitive split, "
-              f"sensitive threshold = {sensitive_threshold}")
-    if sensitive_threshold is not None:
-        lower_rmse = local_rmse(ytest,yhat, ymin, sensitive_threshold)
-        upper_rmse = local_rmse(ytest,yhat, sensitive_threshold, ymax) 
+    if censor_threshold is not None:
+        lower_rmse = local_loss(ytest,yhat, ymin, censor_threshold)
+        upper_rmse = local_loss(ytest,yhat, censor_threshold, ymax) 
+        lower_corr = local_spearman(ytest, yhat, censor_threshold, above=False)
+        upper_corr = local_spearman(ytest, yhat, censor_threshold, above=True)
     
     # dump results
     if dir_name:
-        os.makedirs(dir_name, exist_ok=True)
         print(f'Saving results to {dir_name} folder')
         train_curve_path = f'{dir_name}/trainingcurve_{jobname}.json'
         parity_plot_path = f'{dir_name}/parityplotdata_{jobname}.json'
@@ -667,16 +755,16 @@ def no_noise_train_wrapper(
         json.dump([epochs,train_loss,val_loss],f1)
 
     with open(parity_plot_path,'w') as f2:
-        if sensitive_threshold:
-            json.dump([str(rmse),lower_rmse,upper_rmse,ytest,yhat],f2)
+        if censor_threshold:
+            json.dump([str(rmse),lower_rmse,upper_rmse, corr, lower_corr, upper_corr, ytest,yhat],f2)
         else:
-            json.dump([str(rmse),ytest,yhat],f2)
-
-    return rmse, lower_rmse, upper_rmse
+            json.dump([str(rmse), corr, ytest,yhat],f2)
+    if censor_threshold:
+        return rmse, lower_rmse, upper_rmse, corr, lower_corr, upper_corr
+    return rmse, corr
 
 # omission method baseline
 def omit_train_wrapper(
-        rawdata, 
         censor_region, 
         censor_split=None,
         censor_threshold=None,
@@ -686,24 +774,44 @@ def omit_train_wrapper(
         dir_name="omit_results",
         random_state=None,
         verbose=True,
+        rawdata = None, 
+        separate_train_path=None,  # Path to pre-split training data
+        separate_val_path=None,    # Path to pre-split validation data
+        separate_test_path=None,
+        save_split_data = True,
     ):
+    os.makedirs(dir_name, exist_ok=True)
     if model_config == None:
         model_config = Config()
     if jobname == None:
         jobname = 'omitted_data'
 
-    # compute threshold from sensitive/non-sensitive split
-    if censor_split is not None:
-        labels = [label for _, label in rawdata]
-        censor_threshold = compute_threshold_from_split(
-            labels, censor_split, censor_region
-        )
-        print(f"With {censor_split:.0%} censored split, "
-              f"censor threshold = {censor_threshold}")
+    if separate_train_path and separate_val_path and separate_test_path:
+        train_subset = pd.read_csv(separate_train_path)
+        val_subset = pd.read_csv(separate_val_path)
+        test_subset = pd.read_csv(separate_test_path)
+        if censor_threshold is None:
+            raise ValueError("censor_threshold is required if pre-split data paths are provided.")
+        print(f'Censor threshold = {censor_threshold}')
+    else:
+        if rawdata is None:
+            raise ValueError("rawdata must be provided if pre-split data paths are not specified.")
+        # compute threshold from sensitive/non-sensitive split
+        if censor_threshold is None and censor_split is not None:
+            censor_threshold = compute_threshold_from_split(
+                rawdata.labels, censor_split, censor_region
+            )
+            print(f"With {censor_split:.0%} censored split, ")
+            print(f"censor threshold = {censor_threshold}")
 
-    train_subset, val_subset, test_subset = split_dataset(
-        rawdata, frac_list=[0.8, 0.1, 0.1], shuffle=True,random_state=random_state
-    )
+        # split data
+        train_subset, nontrain_subset = train_test_split(rawdata, test_size=2*model_config.split, random_state=random_state)
+        val_subset, test_subset = train_test_split(nontrain_subset, test_size=0.5, random_state=random_state)
+        if save_split_data:
+            os.makedirs(f"{dir_name}/data", exist_ok=True)
+            train_subset.to_csv(f"{dir_name}/data/train_data_{random_state}.csv", index=False)
+            val_subset.to_csv(f"{dir_name}/data/val_data_{random_state}.csv", index=False)
+            test_subset.to_csv(f"{dir_name}/data/test_data_{random_state}.csv", index=False)
 
     # omit data in sensitive region 
     print(f'Omitting {omit_fraction:.0%} of sensitive data in training data...')
@@ -715,11 +823,10 @@ def omit_train_wrapper(
         val_subset, censor_threshold, censor_region, omit_fraction
     )
     
-    _, raw_y = zip(*train_subset)
-    _, filtered_y = zip(*filtered_train_subset)
-    os.makedirs(dir_name, exist_ok=True)
     with open(f'{dir_name}/omittedlabels.json','w') as f0:
-        json.dump([raw_y,filtered_y],f0)
+        original_labels = train_subset['labels'].tolist()
+        filtered_labels = filtered_train_subset['labels'].tolist()
+        json.dump([original_labels, filtered_labels], f0)
 
     # convert to DGL dataset
     test_data = dgldataset(test_subset)
@@ -737,20 +844,22 @@ def omit_train_wrapper(
     ymin = min(ytest)
     ymax = max(ytest)
     yhat, rmse = evaluate(model, (test_data.graphs, ytest))
-    lower_rmse = local_rmse(ytest,yhat, ymin, censor_threshold) # region below threshold
-    upper_rmse = local_rmse(ytest,yhat, censor_threshold, ymax) # region above threshold 
+    lower_rmse = local_loss(ytest,yhat, ymin, censor_threshold) # region below threshold
+    upper_rmse = local_loss(ytest,yhat, censor_threshold, ymax) # region above threshold 
+    corr = spearmanr(ytest,yhat)[0]
+    lower_corr = local_spearman(ytest, yhat, censor_threshold, above=False)
+    upper_corr = local_spearman(ytest, yhat, censor_threshold, above=True)
 
     epochs = np.arange(model_config.epochs).tolist()
     with open(f'{dir_name}/trainingcurve_{jobname}.json','w') as f1:
         json.dump([epochs,train_loss,val_loss],f1)
 
     with open(f'{dir_name}/parityplotdata_{jobname}.json','w') as f2:
-        json.dump([str(rmse),lower_rmse,upper_rmse,ytest,yhat],f2)
+        json.dump([str(rmse),lower_rmse,upper_rmse,corr,lower_corr,upper_corr,ytest,yhat],f2)
 
-    return rmse, lower_rmse, upper_rmse
+    return rmse, lower_rmse, upper_rmse, corr, lower_corr, upper_corr
 
-def xnoise_train_wrapper(
-        rawdata, 
+def xnoise_train_wrapper( 
         simscore_range, 
         censor_region, 
         censor_split=None,
@@ -760,25 +869,45 @@ def xnoise_train_wrapper(
         dir_name="xnoise_results",
         random_state=None,
         verbose=True,
+        rawdata = None, 
+        separate_train_path=None,  # Path to pre-split training data
+        separate_val_path=None,    # Path to pre-split validation data
+        separate_test_path=None,
+        save_split_data = True,
     ):
+    os.makedirs(dir_name, exist_ok=True)
     if model_config == None:
         model_config = Config()
     if jobname == None:
         jobname = f'similarityscore{str(simscore_range[0])}-{str(simscore_range[1])}'
+    
+    if separate_train_path and separate_val_path and separate_test_path:
+        train_subset = pd.read_csv(separate_train_path)
+        val_subset = pd.read_csv(separate_val_path)
+        test_subset = pd.read_csv(separate_test_path)
+        if censor_threshold is None:
+            raise ValueError("censor_threshold is required if pre-split data paths are provided.")
+        print(f'Censor threshold = {censor_threshold}')
+    else:
+        if rawdata is None:
+            raise ValueError("rawdata must be provided if pre-split data paths are not specified.")
+        # compute threshold from sensitive/non-sensitive split
+        if censor_threshold is None and censor_split is not None:
+            censor_threshold = compute_threshold_from_split(
+                rawdata.labels, censor_split, censor_region
+            )
+            print(f"With {censor_split:.0%} censored split, ")
+            print(f"censor threshold = {censor_threshold}")
 
-    # compute threshold from sensitive/non-sensitive split
-    if censor_split is not None:
-        labels = [label for _, label in rawdata]
-        censor_threshold = compute_threshold_from_split(
-            labels, censor_split, censor_region
-        )
-        print(f"With {censor_split:.0%} censored split, "
-              f"censor threshold = {censor_threshold}")
+        # split data
+        train_subset, nontrain_subset = train_test_split(rawdata, test_size=2*model_config.split, random_state=random_state)
+        val_subset, test_subset = train_test_split(nontrain_subset, test_size=0.5, random_state=random_state)
+        if save_split_data:
+            os.makedirs(f"{dir_name}/data", exist_ok=True)
+            train_subset.to_csv(f"{dir_name}/data/train_data_{random_state}.csv", index=False)
+            val_subset.to_csv(f"{dir_name}/data/val_data_{random_state}.csv", index=False)
+            test_subset.to_csv(f"{dir_name}/data/test_data_{random_state}.csv", index=False)
 
-    # split data
-    train_subset, val_subset, test_subset = split_dataset(
-        rawdata, frac_list=[0.8, 0.1, 0.1], shuffle=True, random_state=random_state
-    )
     train_data = Xnoised_dataset(
         train_subset,
         scorerange=simscore_range, 
@@ -808,8 +937,11 @@ def xnoise_train_wrapper(
     ymin = min(ytest)
     ymax = max(ytest)
     yhat, rmse = evaluate(model, (test_data.graphs, ytest))
-    lower_rmse = local_rmse(ytest,yhat, ymin, censor_threshold) 
-    upper_rmse = local_rmse(ytest,yhat, censor_threshold, ymax)  
+    lower_rmse = local_loss(ytest,yhat, ymin, censor_threshold) 
+    upper_rmse = local_loss(ytest,yhat, censor_threshold, ymax)  
+    corr = spearmanr(ytest,yhat)[0]
+    lower_corr = local_spearman(ytest, yhat, censor_threshold, above=False)
+    upper_corr = local_spearman(ytest, yhat, censor_threshold, above=True)
     
     # bonus: evaluate how it predicts 'fake' test data (data with censored sensitive info)
     noised_test_data = Xnoised_dataset(
@@ -823,24 +955,23 @@ def xnoise_train_wrapper(
     ymin = min(noised_ytest)
     ymax = max(noised_ytest)
     noised_yhat, noised_rmse = evaluate(model, (noised_test_data.graphs, noised_ytest))
-    noised_lower_rmse = local_rmse(noised_ytest,noised_yhat, ymin, censor_threshold)
-    noised_upper_rmse = local_rmse(noised_ytest,noised_yhat, censor_threshold, ymax)
+    noised_lower_rmse = local_loss(noised_ytest,noised_yhat, ymin, censor_threshold)
+    noised_upper_rmse = local_loss(noised_ytest,noised_yhat, censor_threshold, ymax)
 
     # save data in json files
-    os.makedirs(dir_name, exist_ok=True)
-    with open(f'{dir_name}/noisedsmiles_{jobname}.json','w') as f0:
-        json.dump([
-            noised_test_data.labels,
-            noised_test_data.similarityscores, 
-            noised_test_data.iterations
-        ],f0)
+#     with open(f'{dir_name}/noisedsmiles_{jobname}.json','w') as f0:
+#         json.dump([
+#             noised_test_data.labels,
+#             noised_test_data.similarityscores, 
+#             #noised_test_data.iterations # outdated, not using iterations anymore
+#         ],f0)
     
     epochs = np.arange(model_config.epochs).tolist()
     with open(f'{dir_name}/trainingcurve_{jobname}.json','w') as f1:
         json.dump([epochs,train_loss,val_loss],f1)
 
     with open(f'{dir_name}/parityplotdata_{jobname}.json','w') as f2: 
-        json.dump([str(rmse),lower_rmse, upper_rmse,ytest,yhat],f2)
+        json.dump([str(rmse),lower_rmse, upper_rmse,corr,lower_corr,upper_corr,ytest,yhat],f2)
 
     with open(f'{dir_name}/parityplotdata_noisedtestdata_{jobname}.json','w') as f3: 
         # note that this uses NOISED test data
@@ -852,10 +983,9 @@ def xnoise_train_wrapper(
             noised_yhat
         ],f3)
     print('Results are stored in json files.')
-    return rmse, lower_rmse, upper_rmse
+    return rmse, lower_rmse, upper_rmse, corr, lower_corr, upper_corr
 
 def ynoise_train_wrapper(
-        rawdata,  
         noise_level, 
         censor_region, 
         censor_split=None,
@@ -864,26 +994,46 @@ def ynoise_train_wrapper(
         jobname=None,
         dir_name="ynoise_results",
         random_state=None, 
-        verbose=True
+        verbose=True,
+        rawdata = None,
+        separate_train_path=None,  # Path to pre-split training data
+        separate_val_path=None,    # Path to pre-split validation data
+        separate_test_path=None,
+        save_split_data = True,
     ):
+    os.makedirs(dir_name, exist_ok=True)
     if model_config == None:
         model_config = Config()
     if jobname == None:
         jobname = f'ynoise{noise_level}'
 
-    # compute threshold from sensitive/non-sensitive split
-    if censor_split is not None:
-        labels = [label for _, label in rawdata]
-        censor_threshold = compute_threshold_from_split(
-            labels, censor_split, censor_region
-        )
-        print(f"With {censor_split:.0%} censored split, "
-              f"censor threshold = {censor_threshold}")
+    if separate_train_path and separate_val_path and separate_test_path:
+        train_subset = pd.read_csv(separate_train_path)
+        val_subset = pd.read_csv(separate_val_path)
+        test_subset = pd.read_csv(separate_test_path)
+        if censor_threshold is None:
+            raise ValueError("censor_threshold is required if pre-split data paths are provided.")
+        print(f'Censor threshold = {censor_threshold}')
+    else:
+        if rawdata is None:
+            raise ValueError("rawdata must be provided if pre-split data paths are not specified.")
+        # compute threshold from sensitive/non-sensitive split
+        if censor_threshold is None and censor_split is not None:
+            censor_threshold = compute_threshold_from_split(
+                rawdata.labels, censor_split, censor_region
+            )
+            print(f"With {censor_split:.0%} censored split, ")
+            print(f"censor threshold = {censor_threshold}")
 
-    # split data
-    train_subset, val_subset, test_subset = split_dataset(
-        rawdata, frac_list=[0.8, 0.1, 0.1], shuffle=True, random_state=random_state
-    )
+        # split data
+        train_subset, nontrain_subset = train_test_split(rawdata, test_size=2*model_config.split, random_state=random_state)
+        val_subset, test_subset = train_test_split(nontrain_subset, test_size=0.5, random_state=random_state)
+        if save_split_data:
+            os.makedirs(f"{dir_name}/data", exist_ok=True)
+            train_subset.to_csv(f"{dir_name}/data/train_data_{random_state}.csv", index=False)
+            val_subset.to_csv(f"{dir_name}/data/val_data_{random_state}.csv", index=False)
+            test_subset.to_csv(f"{dir_name}/data/test_data_{random_state}.csv", index=False)
+
     test_data = dgldataset(test_subset)
     
     # noising the training and val data
@@ -903,7 +1053,6 @@ def ynoise_train_wrapper(
     # save raw and noised labels for sanity check
     raw_y = train_data.rawlabels
     noised_y = train_data.labels
-    os.makedirs(dir_name, exist_ok=True)
     with open(f'{dir_name}/noisedlabels_traindata_{jobname}.json','w') as f0:
         json.dump([raw_y,noised_y],f0)
 
@@ -921,8 +1070,11 @@ def ynoise_train_wrapper(
     ymin = min(ytest)
     ymax = max(ytest)
     yhat, rmse = evaluate(model, (test_data.graphs, ytest))
-    lower_rmse = local_rmse(ytest,yhat, ymin, censor_threshold)
-    upper_rmse = local_rmse(ytest,yhat, censor_threshold, ymax) 
+    lower_rmse = local_loss(ytest,yhat, ymin, censor_threshold)
+    upper_rmse = local_loss(ytest,yhat, censor_threshold, ymax) 
+    corr = spearmanr(ytest,yhat)[0]
+    lower_corr = local_spearman(ytest, yhat, censor_threshold, above=False)
+    upper_corr = local_spearman(ytest, yhat, censor_threshold, above=True)
 
     # bonus: to see how it predicts noised data, whether it 'censors' the noised region
     noised_test_data = Ynoised_dataset(
@@ -935,8 +1087,8 @@ def ynoise_train_wrapper(
     ymin = min(noised_ytest)
     ymax = max(noised_ytest)
     noised_yhat, noised_rmse = evaluate(model, (noised_test_data.graphs, noised_ytest))
-    noised_lower_rmse = local_rmse(noised_ytest,noised_yhat, ymin, censor_threshold) 
-    noised_upper_rmse = local_rmse(noised_ytest,noised_yhat, censor_threshold, ymax)
+    noised_lower_rmse = local_loss(noised_ytest,noised_yhat, ymin, censor_threshold) 
+    noised_upper_rmse = local_loss(noised_ytest,noised_yhat, censor_threshold, ymax)
 
     # save data in json files
     epochs = np.arange(model_config.epochs).tolist()
@@ -944,7 +1096,7 @@ def ynoise_train_wrapper(
         json.dump([epochs,train_loss,val_loss],f1)
     
     with open(f'{dir_name}/parityplotdata_{jobname}.json','w') as f2: 
-        json.dump([str(rmse),lower_rmse,upper_rmse,ytest,yhat],f2)
+        json.dump([str(rmse),lower_rmse,upper_rmse,corr,lower_corr,upper_corr,ytest,yhat],f2)
 
     with open(f'{dir_name}/parityplotdata_noisedtestdata_{jobname}.json','w') as f3: 
         # note that this is with NOISED test data
@@ -957,7 +1109,7 @@ def ynoise_train_wrapper(
         ],f3)
     print('json files are loaded!')
 
-    return rmse, lower_rmse, upper_rmse
+    return rmse, lower_rmse, upper_rmse, corr, lower_corr, upper_corr
 
 # if __name__ == "__main__":
 #     lipodata = pd.read_csv("./lipophilicity.csv")

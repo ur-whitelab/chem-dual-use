@@ -1,10 +1,13 @@
+import json
+import random
+from dataclasses import dataclass
+
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import numpy as np
-import random
-from dataclasses import dataclass
+from scipy.stats import spearmanr
 
 from censor_methods import noising, omit_sensitive_data
 
@@ -107,11 +110,11 @@ def train(
         patience=model_config.patience, 
         min_delta=model_config.min_delta,
     )
-    rmse = RMSELoss()
+    #loss_fxn = RMSELoss()
+    loss_fxn = nn.MSELoss()
 
     losses = []
     val_losses = []
-    patience = 0
     for epoch in range(model_config.epochs):
         model.train()
         trainsize = len(train_features)
@@ -123,7 +126,7 @@ def train(
             batch_labels = train_labels[batch_idxs]
 
             pred = model(batch_features)
-            loss = rmse(pred,batch_labels)
+            loss = loss_fxn(pred,batch_labels)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -134,7 +137,7 @@ def train(
         model.eval()
         with torch.no_grad():
             val_pred = model(val_features)
-            val_loss = rmse(val_pred,val_labels)
+            val_loss = loss_fxn(val_pred,val_labels)
         val_losses.append(val_loss.item())
 
         if epoch % 1 == 0 and verbose:
@@ -145,13 +148,27 @@ def train(
             break
     return losses, val_losses
 
-def local_loss(y,yhat, min, max):
+def local_rmse_loss(y,yhat, min, max):
     rmse = RMSELoss()
     mask = (y >= min) & (y <= max)
     local_y = y[mask]
     local_yhat = yhat[mask]
     local_rmse = rmse(local_yhat, local_y)
     return local_rmse.item()
+
+def local_mse_loss(y, yhat, min, max):
+    mask = (y >= min) & (y <= max)
+    local_y = y[mask]
+    local_yhat = yhat[mask]
+    local_mse = F.mse_loss(local_yhat, local_y)
+    return local_mse.item()
+
+def local_correlation(y, yhat, min, max):
+    mask = (y >= min) & (y <= max)
+    local_y = y[mask]
+    local_yhat = yhat[mask]
+    corr = spearmanr(local_y, local_yhat)
+    return corr
 
 def data_split(data, val_split=0.1, test_split=0.1, random_state=None):
     # split into train, val, and test sets
@@ -189,143 +206,8 @@ def compute_threshold_from_split(labels, split, region):
     threshold = sorted_labels[index]
     return threshold
 
-def mlptask_wrapper_v1( # without control over omission probability
-        seed, 
-        tasks, 
-        sensitive_threshold, 
-        sensitive_region, 
-        verbose=False, 
-        sanitycheckplot=False
-    ):
-    """
-    This wrapper function executes a series of training tasks on separate MLP models.
-    'tasks' is input list of tuples containing task configurations, each consisting of:
-        task_name (string): name of the task
-        xnoise (float): gaussian noise level applied to features in sensitive region
-        ynoise (float): gaussian noise level applied to labels in sensitive region
-        omit (boolean): to omit the sensitive region
 
-    # example of tasks
-    tasks = [
-        ('baseline', 0, 0, False),
-        ('omission', 0, 0, True),
-        ('x noise', 2.0, 0, False),
-        ('y noise', 0, 1.0, False),
-    ]
-
-    Returns:
-        results (dictionary): Contains dictionaries of training losses, 
-            validation losses, predictions, and y values of the test set, 
-            test errors for non-sensitive and sensitive regions.
-    """
-
-    # generate data - use a different random seed
-    setseed(seed + 1)
-    data = generatedata(config.Din, config.hidden_dim, config.datasize)
-    features, labels = data
-    traindata, valdata, testdata = data_split(
-        data, val_split=config.split, test_split=config.split, random_state=seed
-    )
-    x_test, y_test = testdata
-    y_min = y_test.min().item()
-    y_max = y_test.max().item()
-
-    all_losses = {}
-    all_val_losses = {}
-    all_preds = {}
-    overall_error = {}
-    lower_error = {}
-    upper_error = {}
-    x_levels = {}
-    y_levels = {}
-    omission = {}
-    # #results = {}
-    for task_name, xnoise, ynoise, omit in tasks:
-        setseed(seed)
-        model = MLP(config.Din, config.hidden_dim)
-        task_traindata = traindata
-        task_valdata = valdata
-
-        if omit:
-            # task_traindata = filterdata_by_label(traindata, threshold=sensitive_threshold, omitregion=sensitive_region)
-            # task_valdata = filterdata_by_label(valdata, threshold=sensitive_threshold, omitregion=sensitive_region)
-            task_traindata = omit_sensitive_data(
-                traindata, 
-                threshold=sensitive_threshold, 
-                sensitive_region=sensitive_region, 
-                omit_probability=1, 
-                plot=sanitycheckplot
-            )
-            task_valdata = omit_sensitive_data(
-                valdata, 
-                threshold=sensitive_threshold, 
-                sensitive_region=sensitive_region, 
-                omit_probability=1, 
-                plot=False
-            )
-
-        elif xnoise or ynoise:
-            task_traindata = noising(
-                traindata, xnoise, ynoise, sensitive_threshold, plot=sanitycheckplot
-            )
-            task_valdata = noising(
-                valdata, xnoise, ynoise, sensitive_threshold, plot=False
-            )
-
-        x_levels[task_name] = xnoise
-        y_levels[task_name] = ynoise
-        omission[task_name] = omit
-
-        # # losses, val_losses = train(model, task_traindata, task_valdata, verbose=verbose)
-        # # model.eval()
-        # # with torch.no_grad():
-        # #     preds = model(x_test)
-
-        # # # calculate test errors for labelled regions above/below the 'sensitive' threshold
-        # # lower_error = local_loss(y_test, preds, y_min, sensitive_threshold) # below sensitive threshold
-        # # upper_error = local_loss(y_test, preds, sensitive_threshold, y_max) # above
-
-        # # results[task_name] = {
-        # #     'x_noise_level': xnoise,
-        # #     'y_noise_level': ynoise,
-        # #     'omit': omit,
-        # #     'train_loss': losses,
-        # #     'val_loss': val_losses,
-        # #     'pred': preds,
-        # #     'y_test': y_test,
-        # #     'lower_error': lower_error,
-        # #     'upper_error': upper_error,
-        # # }
-
-        all_losses[task_name], all_val_losses[task_name] = train(
-            model, task_traindata, task_valdata, verbose=verbose
-        )
-        model.eval()
-        with torch.no_grad():
-            preds = model(x_test)
-        all_preds[task_name] = preds
-        rmse = RMSELoss()
-        overall_error[task_name] = rmse(preds, y_test).item()
-
-        # calculate test errors for non-sensitive and sensitive regions
-        lower_error[task_name] = local_loss(y_test, preds, y_min, sensitive_threshold)
-        upper_error[task_name] = local_loss(y_test, preds, sensitive_threshold, y_max)
-
-    results = {
-        'x_noise_level': x_levels,
-        'y_noise_level': y_levels,
-        'omit': omission,
-        'train_loss': all_losses,
-        'val_loss': all_val_losses,
-        'pred': all_preds,
-        'y_test': y_test,
-        'overall_error': overall_error,
-        'lower_error': lower_error,
-        'upper_error': upper_error,
-    }
-    return results
-
-def mlptask_wrapper_v2( # with control over omission probability
+def mlptask_wrapper(
         seed, 
         tasks,  
         censor_region, 
@@ -374,6 +256,14 @@ def mlptask_wrapper_v2( # with control over omission probability
     traindata, valdata, testdata = data_split(
         data, val_split=model_config.split, test_split=model_config.split, random_state=seed
     )
+    # save data split
+    with open(f'seed{seed}_data_split.json', 'w') as f:
+        json.dump({
+            'train': traindata,
+            'val': valdata,
+            'test': testdata,
+        }, f)
+    
     x_test, y_test = testdata
     y_min = y_test.min().item()
     y_max = y_test.max().item()
@@ -388,6 +278,12 @@ def mlptask_wrapper_v2( # with control over omission probability
     y_levels = {}
     omission = {}
     omit_frac = {}
+    overall_spearman_corr = {}
+    overall_p_val = {}
+    lower_spearman_corr = {}
+    lower_p_val = {}
+    upper_spearman_corr = {}
+    upper_p_val = {}
     for task_name, xnoise, ynoise, omit, omit_fraction in tasks:
         setseed(seed)
         model = MLP(model_config.Din, model_config.hidden_dim)
@@ -422,16 +318,46 @@ def mlptask_wrapper_v2( # with control over omission probability
         all_losses[task_name], all_val_losses[task_name] = train(
             model, task_traindata, task_valdata, model_config, verbose=verbose
         )
+        torch.save(model.state_dict(), f'{task_name}_model_weights.pth')
+        # save training log
+        with open(f'{task_name}_training_log.json', 'w') as f:
+            json.dump({
+                'train_loss': all_losses[task_name],
+                'val_loss': all_val_losses[task_name],
+            }, f)
+            
         model.eval()
         with torch.no_grad():
             preds = model(x_test)
         all_preds[task_name] = preds
-        rmse = RMSELoss()
+        rmse = RMSELoss() # while I used MSE for training loss, I'm using RMSE as metric
         overall_error[task_name] = rmse(preds, y_test).item()
 
         # calculate test errors for regions above/below the 'sensitive' threshold
-        lower_error[task_name] = local_loss(y_test, preds, y_min, censor_threshold)
-        upper_error[task_name] = local_loss(y_test, preds, censor_threshold, y_max)
+        lower_error[task_name] = local_rmse_loss(y_test, preds, y_min, censor_threshold)
+        upper_error[task_name] = local_rmse_loss(y_test, preds, censor_threshold, y_max)
+
+        # calculate spearman correlations
+        overall_spearman_corr[task_name], overall_p_val[task_name] = spearmanr(y_test, preds)
+        lower_spearman_corr[task_name], lower_p_val[task_name] = local_correlation(y_test, preds, y_min, censor_threshold)
+        upper_spearman_corr[task_name], upper_p_val[task_name] = local_correlation(y_test, preds, censor_threshold, y_max)
+
+
+
+    # save metrics
+    with open(f'seed{seed}_testerrors.json', 'w') as f:
+        json.dump({
+            'overall_rmse': overall_error,
+            'lower_rmse': lower_error,
+            'upper_rmse': upper_error,
+    
+            'overall_spearman_corr': overall_spearman_corr,
+            'overall_p_val': overall_p_val,
+            'lower_spearman_corr': lower_spearman_corr,
+            'lower_p_val': lower_p_val,
+            'upper_spearman_corr': upper_spearman_corr,
+            'upper_p_val': upper_p_val,
+        }, f)
 
     results = {
         'censor_threshold': censor_threshold,
@@ -446,5 +372,8 @@ def mlptask_wrapper_v2( # with control over omission probability
         'overall_error': overall_error,
         'lower_error': lower_error,
         'upper_error': upper_error,
+        'overall_spearman_corr': overall_spearman_corr,
+        'lower_spearman_corr': lower_spearman_corr,
+        'upper_spearman_corr': upper_spearman_corr,
     }
     return results

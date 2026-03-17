@@ -1,0 +1,37 @@
+name: dualusage
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy=1.25.2
+  - pandas=2.0.0
+  - matplotlib=3.7.2
+  - scipy=1.11.3
+  - pillow=9.4.0
+  - networkx=3.1
+  - pyyaml=6.0
+  - jupyter
+  - jupyterlab=3.6.3
+  - notebook=6.5.4
+  - pytorch=2.0.1
+  - torchvision=0.15.2
+  - torchaudio=2.0.2
+  - pip
+  - pip:
+    - dgl==1.1.2.post1
+    - dgllife==0.3.2
+    - exmol==3.0.3
+    - rdkit==2023.3.3
+    - selfies==2.1.1
+    - scikit-learn==1.3.1
+    - seaborn==0.13.0
+    - skunk==1.2.0
+    - PyTDC
+    - papermill
+    - cairosvg
+    - torchinfo==1.8.0
+    - hyperopt==0.2.7
+    - tqdm==4.66.1
+    - numexpr==2.8.7

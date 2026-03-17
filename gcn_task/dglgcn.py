@@ -49,7 +49,7 @@ class Config:
     lr: float = 0.005
     hdim: int = 128
     split: float = 0.1 # 10/10/80 test val train
-    # batch_size
+    batch_size: int = 32
     epochs: int = 60
     patience: int = 5
     min_delta: float = 1e-4 # for early stopping
@@ -460,8 +460,8 @@ def compute_threshold_from_split(labels, split, region):
 
 def train(model, model_config, train_data, val_data, verbose = True):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    train_dataloader = GraphDataLoader(train_data, batch_size=5, drop_last=False)
-    val_dataloader = GraphDataLoader(val_data, batch_size=5, drop_last=False)
+    train_dataloader = GraphDataLoader(train_data, batch_size=model_config.batch_size, drop_last=False)
+    val_dataloader = GraphDataLoader(val_data, batch_size=model_config.batch_size, drop_last=False)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=model_config.lr)
     early_stopper = EarlyStopper(patience=model_config.patience, min_delta=model_config.min_delta)

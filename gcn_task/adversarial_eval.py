@@ -26,7 +26,7 @@ from dglgcn import (
     train as gcn_train,
 )
 
-OUTPUT_DIR = 'OUTPUTS/adversarial'
+OUTPUT_DIR = 'OUTPUTS/adversarial_results'
 ADVERSARIAL_SEED = 555
 CENSOR_REGION = 'above'
 

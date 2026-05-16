@@ -52,7 +52,7 @@ MODEL_CONFIG = Config(    # matches main notebooks
 FINETUNE_CONFIG = Config(
     lr=0.001,
     hdim=128,
-    epochs=150,
+    epochs=500,
     patience=10,
     min_delta=1e-4,
     batch_size=32,
@@ -179,7 +179,7 @@ def adversarial_retrain_wrapper(
 
     if verbose:
         print(f'  [step 2] Training on noised data ({noise_type})...')
-    gcn_train(model, model_config, train_data, val_data, verbose=verbose)
+    noised_train_loss, noised_val_loss = gcn_train(model, model_config, train_data, val_data, verbose=verbose)
 
     # evaluate after noised training (pre-finetune baseline)
     ytest = test_data.labels
@@ -221,6 +221,7 @@ def adversarial_retrain_wrapper(
             'n_finetune_samples': 0,
         }
         _save_results(results, dir_name, jobname)
+        _save_training_curves(noised_train_loss, noised_val_loss, None, None, dir_name, jobname)
         return results
 
     n_finetune = max(1, int(len(sensitive_clean) * clean_frac))
@@ -237,7 +238,7 @@ def adversarial_retrain_wrapper(
     val_clean_data = dgldataset(val_subset)
 
     # 4. retrain whole model on clean sensitive subset
-    gcn_train(model, finetune_config, finetune_data, val_clean_data, verbose=verbose)
+    ft_train_loss, ft_val_loss = gcn_train(model, finetune_config, finetune_data, val_clean_data, verbose=verbose)
 
 
     # 5. evaluate after retraining on clean data
@@ -269,6 +270,7 @@ def adversarial_retrain_wrapper(
         'n_finetune_samples': n_finetune,
     }
     _save_results(results, dir_name, jobname)
+    _save_training_curves(noised_train_loss, noised_val_loss, ft_train_loss, ft_val_loss, dir_name, jobname)
     return results
 
 def _save_results(results, dir_name, jobname):
@@ -277,6 +279,16 @@ def _save_results(results, dir_name, jobname):
         json.dump(results, f, indent=4)
     print(f'  Results saved to {path}')
 
+def _save_training_curves(noised_train, noised_val, ft_train, ft_val, dir_name, jobname):
+    data = {
+        'noised_train_loss': noised_train,
+        'noised_val_loss': noised_val,
+        'ft_train_loss': ft_train,
+        'ft_val_loss': ft_val,
+    }
+    path = f'{dir_name}/training_curves_{jobname}.json'
+    with open(path, 'w') as f:
+        json.dump(data, f)
 
 def run_adversarial_sweep(rawdata):
     """

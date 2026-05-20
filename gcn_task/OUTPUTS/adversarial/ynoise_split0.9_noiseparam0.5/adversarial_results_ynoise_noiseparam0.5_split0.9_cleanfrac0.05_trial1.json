@@ -1,0 +1,16 @@
+{
+    "noised_rmse": 0.7794605493545532,
+    "noised_lower_rmse": 0.869716227054596,
+    "noised_upper_rmse": 0.7728729248046875,
+    "noised_corr": 0.745403732082014,
+    "noised_lower_corr": 0.5469537907813679,
+    "noised_upper_corr": 0.7003393079324327,
+    "finetuned_rmse": 0.7709673047065735,
+    "finetuned_lower_rmse": 1.1271575689315796,
+    "finetuned_upper_rmse": 0.7402306199073792,
+    "finetuned_corr": 0.7243100416772429,
+    "finetuned_lower_corr": 0.47121702913213315,
+    "finetuned_upper_corr": 0.67479611496372,
+    "clean_frac": 0.05,
+    "n_finetune_samples": 150
+}

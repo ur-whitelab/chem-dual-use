@@ -1,0 +1,16 @@
+{
+    "noised_rmse": 0.7626183032989502,
+    "noised_lower_rmse": 0.7106078863143921,
+    "noised_upper_rmse": 1.1169893741607666,
+    "noised_corr": 0.7321457179464252,
+    "noised_lower_corr": 0.7371551351829064,
+    "noised_upper_corr": -0.020716756902294534,
+    "finetuned_rmse": null,
+    "finetuned_lower_rmse": null,
+    "finetuned_upper_rmse": null,
+    "finetuned_corr": null,
+    "finetuned_lower_corr": null,
+    "finetuned_upper_corr": null,
+    "clean_frac": 0.0,
+    "n_finetune_samples": 0
+}
